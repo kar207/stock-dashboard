@@ -467,10 +467,54 @@ def get_engine():
     password = quote_plus('Kar@+-2818')
     return create_engine(f'mysql+mysqlconnector://root:{password}@localhost/stock_analytics')
 
-engine = get_engine()
 
-# ── Load Stock Names from DB ──
-all_stocks_df = pd.read_sql("SELECT DISTINCT stock_name FROM stock_prices", engine)
+@st.cache_data
+def load_fallback_csv_data():
+    csv_df = pd.read_csv('stock_data_clean.csv')
+    csv_df = csv_df.rename(
+        columns={
+            'Date': 'trade_date',
+            'Stock': 'stock_name',
+            'Open': 'open_price',
+            'High': 'high_price',
+            'Low': 'low_price',
+            'Close': 'close_price',
+            'Volume': 'volume',
+        }
+    )
+
+    required_cols = {
+        'trade_date',
+        'stock_name',
+        'open_price',
+        'high_price',
+        'low_price',
+        'close_price',
+        'volume',
+    }
+    missing_cols = required_cols - set(csv_df.columns)
+    if missing_cols:
+        raise ValueError(f'Missing required columns in CSV: {sorted(missing_cols)}')
+
+    csv_df['trade_date'] = pd.to_datetime(csv_df['trade_date'])
+    for col in ['open_price', 'high_price', 'low_price', 'close_price', 'volume']:
+        csv_df[col] = pd.to_numeric(csv_df[col], errors='coerce')
+
+    return csv_df
+
+engine = None
+all_data_df = None
+data_source = 'database'
+
+try:
+    engine = get_engine()
+    all_stocks_df = pd.read_sql('SELECT DISTINCT stock_name FROM stock_prices', engine)
+except Exception:
+    data_source = 'csv'
+    all_data_df = load_fallback_csv_data()
+    all_stocks_df = pd.DataFrame({'stock_name': sorted(all_data_df['stock_name'].dropna().unique())})
+    st.info('Database is unreachable in this environment. Using bundled CSV data instead.')
+
 stock_list = all_stocks_df['stock_name'].tolist()
 
 if not stock_list:
@@ -484,10 +528,19 @@ stock = st.sidebar.radio('Stocks', stock_list, label_visibility='collapsed')
 selected_logo = STOCK_LOGOS.get(stock, DEFAULT_LOGO)
 
 # ── Load Stock Data ──
-df = pd.read_sql(
-    f"SELECT * FROM stock_prices WHERE stock_name='{stock}' ORDER BY trade_date",
-    engine
-)
+if data_source == 'database':
+    try:
+        df = pd.read_sql(
+            f"SELECT * FROM stock_prices WHERE stock_name='{stock}' ORDER BY trade_date",
+            engine,
+        )
+    except Exception:
+        data_source = 'csv'
+        all_data_df = load_fallback_csv_data()
+        st.info('Falling back to CSV because live database query failed.')
+
+if data_source == 'csv':
+    df = all_data_df[all_data_df['stock_name'] == stock].sort_values('trade_date').copy()
 
 if df.empty:
     st.error(f"No data found for '{stock}'.")
