@@ -524,6 +524,9 @@ if not stock_list:
 stock_list = sorted(stock_list)
 st.sidebar.markdown('### Stocks')
 stock = st.sidebar.radio('Stocks', stock_list, label_visibility='collapsed')
+benchmark_choices = ['None'] + [s for s in stock_list if s != stock]
+benchmark_stock = st.sidebar.selectbox('Compare With', benchmark_choices, index=0)
+ma_window = st.sidebar.slider('Moving Average Window (days)', min_value=5, max_value=30, value=7)
 
 selected_logo = STOCK_LOGOS.get(stock, DEFAULT_LOGO)
 
@@ -547,15 +550,41 @@ if df.empty:
     st.stop()
 
 df['trade_date'] = pd.to_datetime(df['trade_date'])
-df['moving_avg_7'] = df['close_price'].rolling(7).mean()
+
+min_date = df['trade_date'].min().date()
+max_date = df['trade_date'].max().date()
+default_start = (df['trade_date'].max() - pd.Timedelta(days=180)).date()
+if default_start < min_date:
+    default_start = min_date
+
+date_range = st.sidebar.date_input(
+    'Date Range',
+    value=(default_start, max_date),
+    min_value=min_date,
+    max_value=max_date,
+)
+
+if isinstance(date_range, tuple) and len(date_range) == 2:
+    start_date, end_date = date_range
+else:
+    start_date = min_date
+    end_date = max_date
+
+df = df[(df['trade_date'].dt.date >= start_date) & (df['trade_date'].dt.date <= end_date)].copy()
+if df.empty:
+    st.error('No records found in the selected date range. Please widen the window in the sidebar.')
+    st.stop()
+
+df['moving_avg'] = df['close_price'].rolling(ma_window).mean()
+df['daily_return_pct'] = df['close_price'].pct_change() * 100
 
 latest_close = float(df['close_price'].iloc[-1])
 prev_close = float(df['close_price'].iloc[-2]) if len(df) > 1 else latest_close
 day_change_pct = ((latest_close - prev_close) / prev_close * 100) if prev_close else 0.0
 day_change_abs = latest_close - prev_close
 avg_volume = float(df['volume'].mean())
-seven_day_return = ((df['close_price'].iloc[-1] - df['close_price'].iloc[-7]) / df['close_price'].iloc[-7] * 100) if len(df) > 7 else 0.0
-thirty_day_return = ((df['close_price'].iloc[-1] - df['close_price'].iloc[-30]) / df['close_price'].iloc[-30] * 100) if len(df) > 30 else 0.0
+seven_day_return = ((df['close_price'].iloc[-1] - df['close_price'].iloc[-7]) / df['close_price'].iloc[-7] * 100) if len(df) >= 7 else 0.0
+thirty_day_return = ((df['close_price'].iloc[-1] - df['close_price'].iloc[-30]) / df['close_price'].iloc[-30] * 100) if len(df) >= 30 else 0.0
 latest_volume = float(df['volume'].iloc[-1])
 avg_volume_delta_pct = ((latest_volume - avg_volume) / avg_volume * 100) if avg_volume else 0.0
 
@@ -651,7 +680,7 @@ st.markdown(
         <div class='overview-strip'>
             <div class='overview-pill'>
                 <div class='overview-label'>Analysis Window</div>
-                <div class='overview-value'>{analysis_start} to {analysis_end}</div>
+                <div class='overview-value'>{start_date} to {end_date}</div>
             </div>
             <div class='overview-pill'>
                 <div class='overview-label'>Rows Analyzed</div>
@@ -705,7 +734,7 @@ col4.metric('Volatility', f'{volatility:.1f}%', delta=f'{volatility_delta:+.2f}%
 st.markdown("<div class='section-kicker'>Trend</div>", unsafe_allow_html=True)
 price_container = st.container(border=True)
 with price_container:
-    st.subheader(f'{stock} Price Trend with 7-Day Moving Average')
+    st.subheader(f'{stock} Price Trend with {ma_window}-Day Moving Average')
     fig, ax = plt.subplots(figsize=(12, 4.6))
     fig.patch.set_facecolor('#f4f8ff')
     ax.set_facecolor('#fbfdff')
@@ -728,11 +757,11 @@ with price_container:
 
     ax.plot(
         df['trade_date'],
-        df['moving_avg_7'],
+        df['moving_avg'],
         color='#f04f3f',
         linewidth=2.2,
         linestyle='-',
-        label='7-Day MA',
+        label=f'{ma_window}-Day MA',
     )
 
     ax.scatter(df['trade_date'].iloc[-1], df['close_price'].iloc[-1], s=52, color='#2b74ea', zorder=4)
@@ -756,6 +785,47 @@ with price_container:
     ax.legend(frameon=False, loc='upper right', fontsize=10)
     plt.tight_layout()
     st.pyplot(fig)
+
+    if benchmark_stock != 'None':
+        if data_source == 'database':
+            benchmark_df = pd.read_sql(
+                f"SELECT * FROM stock_prices WHERE stock_name='{benchmark_stock}' ORDER BY trade_date",
+                engine,
+            )
+        else:
+            benchmark_df = all_data_df[all_data_df['stock_name'] == benchmark_stock].sort_values('trade_date').copy()
+
+        benchmark_df['trade_date'] = pd.to_datetime(benchmark_df['trade_date'])
+        benchmark_df = benchmark_df[
+            (benchmark_df['trade_date'].dt.date >= start_date)
+            & (benchmark_df['trade_date'].dt.date <= end_date)
+        ].copy()
+
+        if not benchmark_df.empty:
+            base_a = float(df['close_price'].iloc[0])
+            base_b = float(benchmark_df['close_price'].iloc[0])
+            if base_a and base_b:
+                norm_a = (df['close_price'] / base_a) * 100
+                norm_b = (benchmark_df['close_price'] / base_b) * 100
+
+                st.caption(f'Indexed Performance Comparison: {stock} vs {benchmark_stock} (Base = 100)')
+                fig_cmp, ax_cmp = plt.subplots(figsize=(12, 3.8))
+                fig_cmp.patch.set_facecolor('#f4f8ff')
+                ax_cmp.set_facecolor('#fbfdff')
+
+                for spine in ax_cmp.spines.values():
+                    spine.set_visible(False)
+
+                ax_cmp.plot(df['trade_date'], norm_a, color='#2b74ea', linewidth=2.2, label=stock)
+                ax_cmp.plot(benchmark_df['trade_date'], norm_b, color='#0ea371', linewidth=2.2, label=benchmark_stock)
+                ax_cmp.axhline(100, color='#7d8ca4', linestyle='--', linewidth=1.2, alpha=0.6)
+                ax_cmp.grid(True, axis='y', linestyle='--', linewidth=0.7, alpha=0.2)
+                ax_cmp.xaxis.set_major_locator(date_locator)
+                ax_cmp.xaxis.set_major_formatter(mdates.ConciseDateFormatter(date_locator))
+                ax_cmp.set_ylabel('Indexed Price', color='#243b5d', fontsize=10)
+                ax_cmp.legend(frameon=False, loc='upper left', fontsize=10)
+                plt.tight_layout()
+                st.pyplot(fig_cmp)
 
 # ── Volume Chart ──
 st.markdown("<div class='section-kicker'>Liquidity</div>", unsafe_allow_html=True)
@@ -788,6 +858,83 @@ with volume_container:
     ax2.set_ylabel('Volume', color='#243b5d', fontsize=10)
     plt.tight_layout()
     st.pyplot(fig2)
+
+st.markdown("<div class='section-kicker'>Return Diagnostics</div>", unsafe_allow_html=True)
+diag_container = st.container(border=True)
+with diag_container:
+    st.subheader('Daily Return Distribution and Regime Signals')
+    valid_returns = df['daily_return_pct'].dropna()
+
+    up_days = int((valid_returns > 0).sum())
+    down_days = int((valid_returns < 0).sum())
+    flat_days = int((valid_returns == 0).sum())
+    win_rate = (up_days / len(valid_returns) * 100) if len(valid_returns) else 0.0
+
+    dcol1, dcol2, dcol3, dcol4 = st.columns(4)
+    dcol1.metric('Up Days', f'{up_days}')
+    dcol2.metric('Down Days', f'{down_days}')
+    dcol3.metric('Flat Days', f'{flat_days}')
+    dcol4.metric('Win Rate', f'{win_rate:.1f}%')
+
+    if len(valid_returns) < 2:
+        st.info('Not enough data points in selected range for return distribution.')
+    else:
+        fig3, ax3 = plt.subplots(figsize=(12, 3.6))
+        fig3.patch.set_facecolor('#f4f8ff')
+        ax3.set_facecolor('#fbfdff')
+        for spine in ax3.spines.values():
+            spine.set_visible(False)
+
+        ax3.hist(valid_returns, bins=24, color='#2b74ea', alpha=0.72, edgecolor='#e9f0fb')
+        ax3.axvline(valid_returns.mean(), color='#f04f3f', linewidth=2, linestyle='--', label='Mean Daily Return')
+        ax3.axvline(0, color='#7d8ca4', linewidth=1.2, linestyle=':')
+        ax3.grid(True, axis='y', linestyle='--', linewidth=0.8, alpha=0.2)
+        ax3.set_xlabel('Daily Return (%)', color='#243b5d', fontsize=10)
+        ax3.set_ylabel('Frequency', color='#243b5d', fontsize=10)
+        ax3.legend(frameon=False, fontsize=9)
+        plt.tight_layout()
+        st.pyplot(fig3)
+
+    st.markdown('#### Best and Worst Sessions')
+    session_table = df[['trade_date', 'close_price', 'daily_return_pct']].copy()
+    session_table['trade_date'] = session_table['trade_date'].dt.date
+    best_days = session_table.nlargest(5, 'daily_return_pct')
+    worst_days = session_table.nsmallest(5, 'daily_return_pct')
+    t1, t2 = st.columns(2)
+    with t1:
+        st.caption('Top 5 Positive Days')
+        st.dataframe(best_days.rename(columns={'trade_date': 'Date', 'close_price': 'Close', 'daily_return_pct': 'Return %'}), width='stretch')
+    with t2:
+        st.caption('Top 5 Negative Days')
+        st.dataframe(worst_days.rename(columns={'trade_date': 'Date', 'close_price': 'Close', 'daily_return_pct': 'Return %'}), width='stretch')
+
+st.markdown("<div class='section-kicker'>Monthly Momentum</div>", unsafe_allow_html=True)
+monthly_container = st.container(border=True)
+with monthly_container:
+    st.subheader('Month-over-Month Close Return')
+    monthly_close = df.set_index('trade_date')['close_price'].resample('M').last()
+    monthly_return = (monthly_close.pct_change() * 100).dropna()
+    monthly_return_df = monthly_return.reset_index()
+    monthly_return_df.columns = ['Month', 'Monthly Return %']
+    monthly_return_df['Month Label'] = monthly_return_df['Month'].dt.strftime('%b %Y')
+
+    if monthly_return_df.empty:
+        st.info('Not enough data points in selected range for monthly return analysis.')
+    else:
+        fig4, ax4 = plt.subplots(figsize=(12, 3.8))
+        fig4.patch.set_facecolor('#f4f8ff')
+        ax4.set_facecolor('#fbfdff')
+        for spine in ax4.spines.values():
+            spine.set_visible(False)
+
+        month_colors = monthly_return_df['Monthly Return %'].ge(0).map({True: '#0ea371', False: '#db4b4b'})
+        ax4.bar(monthly_return_df['Month Label'], monthly_return_df['Monthly Return %'], color=month_colors, alpha=0.85)
+        ax4.axhline(0, color='#7d8ca4', linewidth=1.2)
+        ax4.grid(True, axis='y', linestyle='--', linewidth=0.8, alpha=0.2)
+        ax4.set_ylabel('Return (%)', color='#243b5d', fontsize=10)
+        ax4.tick_params(axis='x', rotation=35, labelsize=9)
+        plt.tight_layout()
+        st.pyplot(fig4)
 
 # ── Statistical Summary ──
 st.markdown("<div class='section-kicker'>Descriptive Analytics</div>", unsafe_allow_html=True)
@@ -904,17 +1051,21 @@ Rules:
 5. Keep response under 150 words
 Do NOT make future price predictions. Stick to historical analysis.'''
 
+    safe_7d = seven_day_return if len(df) >= 7 else 0.0
+    safe_30d = thirty_day_return if len(df) >= 30 else 0.0
+
     data_context = f'''
 Stock: {stock}
 Analysis Period: {df.trade_date.min().date()} to {df.trade_date.max().date()}
 Current Price: Rs {df.close_price.iloc[-1]:.2f}
-52-Week High: Rs {df.close_price.max():.2f}
-52-Week Low: Rs {df.close_price.min():.2f}
+Range High: Rs {df.close_price.max():.2f}
+Range Low: Rs {df.close_price.min():.2f}
 Average Price: Rs {df.close_price.mean():.2f}
 Price Volatility (CV): {df.close_price.std()/df.close_price.mean()*100:.2f}%
 Average Daily Volume: {df.volume.mean():,.0f}
-Recent 7-Day Return: {((df.close_price.iloc[-1]-df.close_price.iloc[-7])/df.close_price.iloc[-7]*100):.2f}%
-Recent 30-Day Return: {((df.close_price.iloc[-1]-df.close_price.iloc[-30])/df.close_price.iloc[-30]*100):.2f}%
+Recent 7-Day Return: {safe_7d:.2f}%
+Recent 30-Day Return: {safe_30d:.2f}%
+Win Rate: {(df['daily_return_pct'].dropna().gt(0).mean() * 100) if len(df['daily_return_pct'].dropna()) else 0.0:.2f}%
 '''
 
     user_question = st.text_input('Ask about this stock...', placeholder='e.g. How has this stock performed recently?')
